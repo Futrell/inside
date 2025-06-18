@@ -2,7 +2,9 @@ import sys
 import math
 import random
 import itertools
-from collections import namedtuple, defaultdict, Counter
+import functools
+from collections import namedtuple, defaultdict
+from typing import *
 
 import tqdm
 
@@ -18,40 +20,41 @@ def safelog(x):
     else:
         return math.log(x)
 
+def is_close(x, y, eps=10**-5):
+    return abs(x-y) < eps
+
+def splits(n: int, k: int) -> Iterator:
+    assert k >= 1
+    if k > n:
+        return
+    else:
+        for cuts in itertools.combinations(range(1, n), k - 1):
+            indices = (0, *cuts, n)
+            yield tuple((indices[i], indices[i+1]) for i in range(k))
+
 class PCFG:
-    """ PCFG in Chomsky Normal Form. """
-    def __init__(self, nonterminal_rules, terminal_rules, root):
-        self.nt_rules = nonterminal_rules
-        self.t_rules = terminal_rules
+    """ PCFG, not necessarily in Chomsky Normal Form. """
+    def __init__(self, rules, root):
+        self.rules = rules
         self.root = root
 
-        # Build mappings from rhs to rules with probabilities
-        self.nt_rules_inv = defaultdict(list)
-        self.t_rules_inv = defaultdict(list)
-        for rule, p in self.t_rules.items():
-            self.t_rules_inv[rule.rhs[0]].append((rule.lhs, p))
-        for rule, p in self.nt_rules.items():
-            self.nt_rules_inv[rule.rhs].append((rule.lhs, p))
-        
     def score(self, xs):
-        T = len(xs)
-        chart = [[{} for _ in range(T)] for _ in range(T)]
-        for i, word in enumerate(xs):
-            for nt, p in self.t_rules_inv[word]:
-                chart[i][i][nt] = p
-        for span in range(2, T + 1):
-            for i in range(T - span + 1):
-                j = i + span - 1
-                cell = Counter()
-                for k in range(i, j):
-                    left_cell = chart[i][k]
-                    right_cell = chart[k+1][j]
-                    for B, bscore in left_cell.items():
-                        for C, cscore in right_cell.items():
-                            for nt, p in self.nt_rules_inv[B, C]:
-                                cell[nt] += bscore * cscore * p
-                chart[i][j] = cell
-        return safelog(chart[0][T-1][self.root])
+        @functools.cache
+        def f(lhs, start_index, span_size):
+            if span_size == 1 and lhs == xs[start_index]:
+                return 1.0
+            else:
+                result = 0.0
+                for rule, p in self.rules.items():
+                    if rule.lhs == lhs:
+                        for split in splits(span_size, len(rule.rhs)): 
+                            sub_result = 1.0
+                            for rhs_part, (start, end) in zip(rule.rhs, split):
+                                sub_result *= f(rhs_part, start_index + start, end - start)
+                            result += p * sub_result
+                return result
+        result = f(self.root, 0, len(xs))
+        return math.log(result)
 
 def gensym(_state=itertools.count()):
     return 'X' + str(next(_state))
@@ -136,18 +139,33 @@ def convert_to_cnf(rules):
 
     return nt_rules, t_rules
 
-def test():
+def test_anbn():
     for i in range(100):
         p_continue = random.random() * .4
         rules = {
             Rule('S', ('_a', '_b')) : 1 - p_continue,
             Rule('S', ('_a', 'S', '_b')) : p_continue,
         }
+        pcfg = PCFG(rules, 'S')
+        assert is_close(pcfg.score(['_a', '_b']), math.log(1 - p_continue))
+        assert is_close(pcfg.score(['_a', '_a', '_b', '_b']), math.log(p_continue * (1 - p_continue)))
+        assert is_close(pcfg.score(['_a', '_a', '_a', '_b', '_b', '_b']), math.log(p_continue **2 * (1 - p_continue)))
+
+def test_binarize():
+    for i in range(100):
+        p_continue = random.random() * .4
+        rules = {
+            Rule('S', ('_a', '_b')) : 1 - p_continue,
+            Rule('S', ('_a', 'S', '_b')) : p_continue,
+        }
+        pcfg = PCFG(rules, 'S')
         nt_rules, t_rules = convert_to_cnf(rules)
-        pcfg = PCFG(nt_rules, t_rules, 'S')
-        assert pcfg.score(['_a', '_b']) == math.log(1 - p_continue)
-        assert pcfg.score(['_a', '_a', '_b', '_b']) == math.log(p_continue * (1 - p_continue))
-        assert pcfg.score(['_a', '_a', '_a', '_b', '_b', '_b']) == math.log(p_continue **2 * (1 - p_continue))
+        cnf_rules = t_rules | nt_rules
+        cnf_pcfg = PCFG(cnf_rules, 'S')
+        assert is_close(pcfg.score(['_a', '_b']), cnf_pcfg.score(['_a', '_b']))
+        assert is_close(pcfg.score(['_a', '_a', '_b', '_b']), cnf_pcfg.score(['_a', '_a', '_b', '_b']))
+        assert is_close(pcfg.score(['_a', '_a', '_a', '_b', '_b', '_b']), cnf_pcfg.score(['_a', '_a', '_a', '_b', '_b', '_b']))
+    
         
 def read_grammar(grammar_filename):
     rules = {}
@@ -160,13 +178,12 @@ def read_grammar(grammar_filename):
                 if rhs:
                     rule = Rule(lhs, tuple(rhs))
                     rules[rule] = math.exp(float(logprob))
-    nt_rules, t_rules = convert_to_cnf(rules)
-    return PCFG(nt_rules, t_rules, ROOT)
+    return PCFG(rules, ROOT)
 
 def main(grammar_filename, text_filename):
     print("Processing grammar...", file=sys.stderr)
     grammar = read_grammar(grammar_filename)
-    print("Built CNF grammar with %d nonterminal rules." % len(grammar.nt_rules), file=sys.stderr)
+    #print("Built CNF grammar with %d nonterminal rules." % len(grammar.nt_rules), file=sys.stderr)
     print("Calculating inside probabilities...", file=sys.stderr)    
     with open(text_filename) as infile:
         lines = infile.readlines()
@@ -180,3 +197,4 @@ def main(grammar_filename, text_filename):
 
 if __name__ == '__main__':
     main(*sys.argv[1:])
+
